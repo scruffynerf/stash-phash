@@ -5,6 +5,9 @@ This module handles extracting frames from videos and generating sprite images
 for perceptual hashing, replicating the exact behavior of Stash's videophash
 package.
 
+Supports both local files and remote streams (HTTP, HTTPS, HLS, RTMP, etc.)
+via FFmpeg's native protocol support.
+
 The process:
 1. Extract 25 frames (5x5 grid) from the video
 2. Skip first 5% and last 5% of video duration (avoid intros/outros)
@@ -18,15 +21,14 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from PIL import Image
 
 from stash_phash.phash import perception_hash
-
-if TYPE_CHECKING:
-    pass
 
 # Sprite configuration (matches Stash exactly)
 SCREENSHOT_SIZE = 160
@@ -34,24 +36,52 @@ COLUMNS = 5
 ROWS = 5
 CHUNK_COUNT = COLUMNS * ROWS  # 25 frames
 
+# Timeout for ffmpeg operations on streams (in seconds)
+STREAM_TIMEOUT = 30
 
-def get_video_duration(video_path: str | Path, ffprobe_path: str | None = None) -> float:
+# Number of parallel frame extractions for remote streams
+PARALLEL_EXTRACTIONS = 5
+
+
+def is_url(path: str) -> bool:
     """
-    Get the duration of a video file in seconds.
+    Check if a path is a URL (remote stream).
 
     Args:
-        video_path: Path to the video file
-        ffprobe_path: Optional path to ffprobe executable. If None, uses 'ffprobe' from PATH.
+        path: Path or URL string
+
+    Returns:
+        True if the path is a URL, False otherwise
+    """
+    try:
+        result = urlparse(str(path))
+        return result.scheme in ("http", "https", "rtmp", "rtmps", "hls", "mms", "mmsh")
+    except Exception:
+        return False
+
+
+def get_video_duration(
+    video_source: str | Path,
+    ffprobe_path: str | None = None,
+    timeout: int | None = None,
+) -> float:
+    """
+    Get the duration of a video file or stream in seconds.
+
+    Args:
+        video_source: Path to video file or URL to remote stream
+        ffprobe_path: Optional path to ffprobe executable.
+        timeout: Timeout in seconds for ffprobe
 
     Returns:
         Duration in seconds as a float
-
-    Raises:
-        subprocess.CalledProcessError: If ffprobe fails
-        ValueError: If duration cannot be parsed
     """
     ffprobe = ffprobe_path or "ffprobe"
-    video_path = Path(video_path)
+    source_str = str(video_source)
+    is_remote = is_url(source_str)
+
+    if timeout is None and is_remote:
+        timeout = STREAM_TIMEOUT
 
     cmd = [
         ffprobe,
@@ -60,86 +90,146 @@ def get_video_duration(video_path: str | Path, ffprobe_path: str | None = None) 
         "-print_format",
         "json",
         "-show_format",
-        str(video_path),
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    cmd.append(source_str)
+
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
     data = json.loads(result.stdout)
 
+    # Get duration from format
     duration_str = data.get("format", {}).get("duration")
+
     if duration_str is None:
-        raise ValueError(f"Could not determine duration for {video_path}")
+        raise ValueError(f"Could not determine duration for {video_source}")
 
     return float(duration_str)
 
 
 def extract_frame(
-    video_path: str | Path,
+    video_source: str | Path,
     timestamp: float,
     size: int = SCREENSHOT_SIZE,
     ffmpeg_path: str | None = None,
+    timeout: int | None = None,
+    output_path: str | None = None,
 ) -> Image.Image:
     """
     Extract a single frame from a video at the specified timestamp.
 
     Args:
-        video_path: Path to the video file
+        video_source: Path to video file or URL to remote stream
         timestamp: Time in seconds to extract frame from
-        size: Width to resize the frame to (height auto-calculated)
-        ffmpeg_path: Optional path to ffmpeg executable. If None, uses 'ffmpeg' from PATH.
+        size: Width to resize the frame to
+        ffmpeg_path: Optional path to ffmpeg executable
+        timeout: Timeout in seconds
+        output_path: Optional output path (uses temp file if None)
 
     Returns:
         PIL Image of the extracted frame
-
-    Raises:
-        subprocess.CalledProcessError: If ffmpeg fails
     """
     ffmpeg = ffmpeg_path or "ffmpeg"
-    video_path = Path(video_path)
+    source_str = str(video_source)
+    is_remote = is_url(source_str)
 
-    # Use a temporary file for the frame
-    # We use BMP format like Stash for lossless extraction
-    with tempfile.NamedTemporaryFile(suffix=".bmp", delete=False) as tmp:
-        tmp_path = tmp.name
+    if timeout is None:
+        timeout = STREAM_TIMEOUT if is_remote else 60
+
+    # Use provided path or temp file
+    if output_path:
+        tmp_path = output_path
+        cleanup = False
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".bmp", delete=False) as tmp:
+            tmp_path = tmp.name
+        cleanup = True
 
     try:
         cmd = [
             ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
             "-ss",
             str(timestamp),
             "-i",
-            str(video_path),
-            "-vframes",
+            source_str,
+            "-frames:v",
             "1",
             "-vf",
             f"scale={size}:-1",
-            "-y",  # Overwrite output file
+            "-update",
+            "1",
+            "-y",
             tmp_path,
         ]
 
-        subprocess.run(
-            cmd,
-            capture_output=True,
-            check=True,
-        )
+        subprocess.run(cmd, capture_output=True, check=True, timeout=timeout)
 
-        # Load and return the image
         img = Image.open(tmp_path)
-        # Make a copy so we can delete the temp file
         img_copy = img.copy()
         img.close()
-
         return img_copy
 
     finally:
-        # Clean up temp file
-        Path(tmp_path).unlink(missing_ok=True)
+        if cleanup:
+            Path(tmp_path).unlink(missing_ok=True)
+
+
+def extract_frames_parallel(
+    video_source: str | Path,
+    timestamps: list[float],
+    size: int = SCREENSHOT_SIZE,
+    ffmpeg_path: str | None = None,
+    timeout: int | None = None,
+    max_workers: int = PARALLEL_EXTRACTIONS,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[Image.Image]:
+    """
+    Extract multiple frames in parallel using ThreadPoolExecutor.
+
+    This significantly speeds up extraction from remote streams by
+    running multiple FFmpeg processes concurrently.
+
+    Args:
+        video_source: Path to video file or URL to remote stream
+        timestamps: List of timestamps in seconds
+        size: Width to resize frames to
+        ffmpeg_path: Optional path to ffmpeg executable
+        timeout: Timeout per extraction in seconds
+        max_workers: Maximum parallel extractions
+        progress_callback: Optional callback(completed, total)
+
+    Returns:
+        List of PIL Images in timestamp order
+    """
+    frames: dict[int, Image.Image] = {}
+    completed = 0
+    total = len(timestamps)
+
+    def extract_single(idx: int, ts: float) -> tuple[int, Image.Image]:
+        return idx, extract_frame(video_source, ts, size, ffmpeg_path, timeout)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(extract_single, i, ts): i for i, ts in enumerate(timestamps)}
+
+        for future in as_completed(futures):
+            idx, img = future.result()
+            frames[idx] = img
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total)
+
+    # Return frames in order
+    return [frames[i] for i in range(len(timestamps))]
 
 
 def generate_sprite(
-    video_path: str | Path,
+    video_source: str | Path,
     ffmpeg_path: str | None = None,
     ffprobe_path: str | None = None,
+    timeout: int | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> Image.Image:
     """
     Generate a sprite image from video frames for perceptual hashing.
@@ -150,44 +240,56 @@ def generate_sprite(
     - Each frame is 160 pixels wide
     - Frames are arranged in a grid
 
+    For remote streams, uses parallel extraction for speed.
+
     Args:
-        video_path: Path to the video file
+        video_source: Path to video file or URL to remote stream
         ffmpeg_path: Optional path to ffmpeg executable
         ffprobe_path: Optional path to ffprobe executable
+        timeout: Timeout in seconds per frame
+        progress_callback: Optional callback(frame_num, total_frames)
 
     Returns:
         PIL Image containing the sprite
-
-    Raises:
-        ValueError: If video duration cannot be determined
-        subprocess.CalledProcessError: If ffmpeg/ffprobe fails
     """
-    video_path = Path(video_path)
+    source_str = str(video_source)
+    is_remote = is_url(source_str)
 
     # Get video duration
-    duration = get_video_duration(video_path, ffprobe_path)
+    duration = get_video_duration(video_source, ffprobe_path, timeout)
 
     # Calculate frame timestamps (skip first/last 5%)
-    # This matches Stash: offset = 0.05 * duration, stepSize = (0.9 * duration) / chunkCount
     offset = 0.05 * duration
     step_size = (0.9 * duration) / CHUNK_COUNT
+    timestamps = [offset + (i * step_size) for i in range(CHUNK_COUNT)]
 
     # Extract frames
-    frames: list[Image.Image] = []
-    for i in range(CHUNK_COUNT):
-        timestamp = offset + (i * step_size)
-        frame = extract_frame(video_path, timestamp, SCREENSHOT_SIZE, ffmpeg_path)
-        frames.append(frame)
+    if is_remote:
+        # Use parallel extraction for remote streams
+        frames = extract_frames_parallel(
+            video_source,
+            timestamps,
+            SCREENSHOT_SIZE,
+            ffmpeg_path,
+            timeout,
+            max_workers=PARALLEL_EXTRACTIONS,
+            progress_callback=progress_callback,
+        )
+    else:
+        # Sequential extraction for local files (fast seeking)
+        frames = []
+        for i, timestamp in enumerate(timestamps):
+            if progress_callback:
+                progress_callback(i + 1, CHUNK_COUNT)
+            frame = extract_frame(video_source, timestamp, SCREENSHOT_SIZE, ffmpeg_path, timeout)
+            frames.append(frame)
 
-    # Combine frames into sprite
     return combine_images(frames)
 
 
 def combine_images(images: list[Image.Image]) -> Image.Image:
     """
     Combine multiple images into a sprite grid.
-
-    This replicates Stash's combineImages function exactly.
 
     Args:
         images: List of PIL Images (should be 25 for video phash)
@@ -198,23 +300,18 @@ def combine_images(images: list[Image.Image]) -> Image.Image:
     if not images:
         raise ValueError("No images to combine")
 
-    # Get dimensions from first image
     width = images[0].width
     height = images[0].height
 
-    # Create canvas
     canvas_width = width * COLUMNS
     canvas_height = height * ROWS
 
-    # Create new RGBA image (like imaging.New in Go)
     sprite = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
 
-    # Paste images in grid
     for index, img in enumerate(images):
         x = width * (index % COLUMNS)
-        y = height * (index // COLUMNS)  # Note: Go uses rows but same calculation
+        y = height * (index // COLUMNS)
 
-        # Convert to RGBA if needed
         if img.mode != "RGBA":
             img = img.convert("RGBA")
 
@@ -224,12 +321,14 @@ def combine_images(images: list[Image.Image]) -> Image.Image:
 
 
 def generate_video_phash(
-    video_path: str | Path,
+    video_source: str | Path,
     ffmpeg_path: str | None = None,
     ffprobe_path: str | None = None,
+    timeout: int | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> int:
     """
-    Generate a perceptual hash for a video file.
+    Generate a perceptual hash for a video file or remote stream.
 
     This is the main entry point for video phash generation. It:
     1. Generates a sprite image from video frames
@@ -237,30 +336,38 @@ def generate_video_phash(
 
     The resulting hash is fully compatible with Stash's phash format.
 
+    Supports:
+    - Local video files (mp4, mkv, avi, webm, etc.)
+    - Remote HTTP/HTTPS URLs
+    - HLS streams (.m3u8)
+    - RTMP streams
+    - Any protocol supported by FFmpeg
+
     Args:
-        video_path: Path to the video file
+        video_source: Path to video file or URL to remote stream
         ffmpeg_path: Optional path to ffmpeg executable
         ffprobe_path: Optional path to ffprobe executable
+        timeout: Timeout in seconds per frame (default: 30s for streams)
+        progress_callback: Optional callback(frame_num, total_frames)
 
     Returns:
         64-bit perceptual hash as an unsigned integer
 
-    Raises:
-        FileNotFoundError: If video file doesn't exist
-        ValueError: If video duration cannot be determined
-        subprocess.CalledProcessError: If ffmpeg/ffprobe fails
-
     Example:
+        >>> # Local file
         >>> phash = generate_video_phash("video.mp4")
-        >>> print(f"{phash:016x}")  # Print as hex
+        >>> print(f"{phash:016x}")
+        >>>
+        >>> # HLS stream
+        >>> phash = generate_video_phash("https://example.com/stream.m3u8")
+        >>> print(f"{phash:016x}")
     """
-    video_path = Path(video_path)
+    source_str = str(video_source)
 
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
+    if not is_url(source_str):
+        video_path = Path(video_source)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
 
-    # Generate sprite from video frames
-    sprite = generate_sprite(video_path, ffmpeg_path, ffprobe_path)
-
-    # Compute and return perceptual hash
+    sprite = generate_sprite(video_source, ffmpeg_path, ffprobe_path, timeout, progress_callback)
     return perception_hash(sprite)
