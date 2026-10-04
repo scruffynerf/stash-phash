@@ -18,7 +18,7 @@ A Python implementation of perceptual hash (pHash) generation that is fully comp
 uv pip install stash-phash
 
 # Or install from source
-git clone https://github.com/yourusername/stash-phash
+git clone https://github.com/hyper440/stash-phash
 cd stash-phash
 uv pip install -e .
 ```
